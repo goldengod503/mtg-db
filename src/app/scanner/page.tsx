@@ -36,6 +36,11 @@ function ScannerContent() {
   const [selectedCard, setSelectedCard] = useState<CardResult | null>(null);
   const [error, setError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
+  const [elapsed, setElapsed] = useState(0);
+  const [stats, setStats] = useState<{ total_duration_ms: number; prompt_eval_count: number; eval_count: number } | null>(null);
+  const [rawResponse, setRawResponse] = useState("");
+  const [cameraReady, setCameraReady] = useState(false);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Configure phase state
   const [quantity, setQuantity] = useState(1);
@@ -49,11 +54,28 @@ function ScannerContent() {
   const startCamera = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+        video: {
+          facingMode: "environment",
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
       });
       streamRef.current = stream;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
+        // iOS requires explicit play() after setting srcObject
+        try {
+          await videoRef.current.play();
+        } catch {
+          // autoplay may handle it
+        }
+      }
+      setCameraReady(true);
+      // Try to enable continuous autofocus
+      const track = stream.getVideoTracks()[0];
+      const capabilities = track.getCapabilities?.();
+      if (capabilities?.focusMode?.includes("continuous")) {
+        await track.applyConstraints({ advanced: [{ focusMode: "continuous" } as MediaTrackConstraintSet] });
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -67,6 +89,7 @@ function ScannerContent() {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     }
+    setCameraReady(false);
   }, []);
 
   useEffect(() => {
@@ -89,6 +112,12 @@ function ScannerContent() {
 
     setPhase("identifying");
     setError("");
+    setElapsed(0);
+    setStats(null);
+
+    timerRef.current = setInterval(() => {
+      setElapsed((prev) => prev + 0.1);
+    }, 100);
 
     try {
       const res = await fetch("/api/scanner/identify", {
@@ -96,6 +125,8 @@ function ScannerContent() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ image: dataUrl }),
       });
+
+      if (timerRef.current) clearInterval(timerRef.current);
 
       const data = await res.json();
 
@@ -107,8 +138,11 @@ function ScannerContent() {
 
       setIdentifiedName(data.identified_name || "");
       setMatchedCards(data.cards || []);
+      if (data.stats) setStats(data.stats);
+      if (data.raw_response) setRawResponse(data.raw_response);
       setPhase("results");
     } catch (err) {
+      if (timerRef.current) clearInterval(timerRef.current);
       setError("Failed to connect to scanner API");
       setPhase("camera");
       console.error("Identify error:", err);
@@ -162,6 +196,8 @@ function ScannerContent() {
     setSelectedCard(null);
     setMatchedCards([]);
     setIdentifiedName("");
+    setRawResponse("");
+    setStats(null);
     setError("");
   };
 
@@ -197,7 +233,8 @@ function ScannerContent() {
       {/* Camera Phase */}
       {phase === "camera" && (
         <div className="space-y-4">
-          <div className="relative bg-black rounded-lg overflow-hidden aspect-video">
+          <div className="relative bg-black rounded-lg overflow-hidden aspect-[3/4] sm:aspect-video">
+            {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
             <video
               ref={videoRef}
               autoPlay
@@ -205,17 +242,26 @@ function ScannerContent() {
               muted
               className="w-full h-full object-cover"
             />
-            {/* Viewfinder overlay */}
+            {/* Viewfinder overlay — responsive sizing */}
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-              <div className="w-64 h-[356px] border-2 border-white/40 rounded-lg" />
+              <div className="w-[55%] max-w-64 aspect-[63/88] border-2 border-white/40 rounded-lg" />
             </div>
           </div>
-          <button
-            onClick={captureAndIdentify}
-            className="w-full px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium text-lg"
-          >
-            Capture & Identify
-          </button>
+          {!cameraReady ? (
+            <button
+              onClick={startCamera}
+              className="w-full px-6 py-4 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium text-lg active:bg-blue-800"
+            >
+              Start Camera
+            </button>
+          ) : (
+            <button
+              onClick={captureAndIdentify}
+              className="w-full px-6 py-4 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium text-lg active:bg-blue-800"
+            >
+              Capture & Identify
+            </button>
+          )}
         </div>
       )}
 
@@ -224,7 +270,10 @@ function ScannerContent() {
         <div className="text-center py-16 space-y-4">
           <div className="inline-block w-10 h-10 border-4 border-blue-500 border-t-transparent rounded-full animate-spin" />
           <p className="text-gray-400 text-lg">
-            Identifying card with Moondream...
+            Identifying card...
+          </p>
+          <p className="text-gray-500 text-sm font-mono">
+            {elapsed.toFixed(1)}s
           </p>
         </div>
       )}
@@ -232,9 +281,28 @@ function ScannerContent() {
       {/* Results Phase */}
       {phase === "results" && (
         <div className="space-y-4">
-          <div className="bg-gray-800 rounded-lg px-4 py-3">
-            <span className="text-gray-400 text-sm">Detected name:</span>{" "}
-            <span className="font-medium text-white">{identifiedName}</span>
+          <div className="bg-gray-800 rounded-lg px-4 py-3 space-y-3">
+            <div>
+              <span className="text-gray-400 text-sm">Detected name:</span>{" "}
+              <span className="font-medium text-white">
+                {identifiedName || "(empty)"}
+              </span>
+            </div>
+            {rawResponse && (
+              <div>
+                <span className="text-gray-400 text-sm block mb-1">Model response:</span>
+                <pre className="text-gray-300 whitespace-pre-wrap text-xs bg-gray-900 rounded p-3">
+                  {rawResponse}
+                </pre>
+              </div>
+            )}
+            {stats && (
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-gray-500 font-mono border-t border-gray-700 pt-2">
+                <span>{(stats.total_duration_ms / 1000).toFixed(1)}s inference</span>
+                <span>{stats.prompt_eval_count} prompt tokens</span>
+                <span>{stats.eval_count} output tokens</span>
+              </div>
+            )}
           </div>
 
           {matchedCards.length === 0 ? (
@@ -258,7 +326,7 @@ function ScannerContent() {
                   <button
                     key={card.id}
                     onClick={() => selectCard(card)}
-                    className="bg-gray-800 rounded-lg overflow-hidden hover:ring-2 hover:ring-blue-500 transition-all text-left"
+                    className="bg-gray-800 rounded-lg overflow-hidden hover:ring-2 hover:ring-blue-500 active:ring-2 active:ring-blue-500 transition-all text-left"
                   >
                     {card.image_uri_small || card.image_uri ? (
                       <img
@@ -328,7 +396,7 @@ function ScannerContent() {
                 <div className="flex items-center gap-2">
                   <button
                     onClick={() => setQuantity(Math.max(1, quantity - 1))}
-                    className="w-8 h-8 bg-gray-700 rounded hover:bg-gray-600 text-lg"
+                    className="w-10 h-10 bg-gray-700 rounded hover:bg-gray-600 active:bg-gray-500 text-lg"
                   >
                     -
                   </button>
@@ -337,7 +405,7 @@ function ScannerContent() {
                   </span>
                   <button
                     onClick={() => setQuantity(quantity + 1)}
-                    className="w-8 h-8 bg-gray-700 rounded hover:bg-gray-600 text-lg"
+                    className="w-10 h-10 bg-gray-700 rounded hover:bg-gray-600 active:bg-gray-500 text-lg"
                   >
                     +
                   </button>
@@ -351,7 +419,7 @@ function ScannerContent() {
                 <select
                   value={finish}
                   onChange={(e) => setFinish(e.target.value)}
-                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white"
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-3 text-white text-base"
                 >
                   <option>Normal</option>
                   <option>Foil</option>
@@ -366,7 +434,7 @@ function ScannerContent() {
                 <select
                   value={condition}
                   onChange={(e) => setCondition(e.target.value)}
-                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white"
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-3 text-white text-base"
                 >
                   <option value="NM">Near Mint (NM)</option>
                   <option value="LP">Lightly Played (LP)</option>
@@ -379,7 +447,7 @@ function ScannerContent() {
 
             <button
               onClick={addToCollection}
-              className="w-full px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
+              className="w-full px-6 py-4 bg-blue-600 text-white rounded-lg hover:bg-blue-700 active:bg-blue-800 font-medium text-lg"
             >
               Add to Collection
             </button>
